@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause)
-/* Copyright (c) 2024 Andrew Palardy */
+/* Copyright (c) 2022 Hengqi Chen */
 #include <signal.h>
 #include <arpa/inet.h>
 #include <unistd.h>

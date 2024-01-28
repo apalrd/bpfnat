@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause)
-/* Copyright (c) 2024 Andrew Palardy */
+/* Copyright (c) 2022 Hengqi Chen */
 #include <vmlinux.h>
 #include <bpf/bpf_endian.h>
 #include <bpf/bpf_helpers.h>
@@ -49,6 +49,38 @@ struct {
 } addrs SEC(".maps");
 
 
+/* Function to calculate the IPv6 psuedo-checksum for a given ip header */
+static inline u16 check_ip6(struct ipv6hdr *ip6)
+{
+	u32 sum = 0;
+	/* Add all of the nibbles from the SA + DA + Length + Next Header */
+	for(int i = 0; i < 8; i++)
+	{
+		sum += ip6->saddr.in6_u.u6_addr16[i];
+		sum += ip6->daddr.in6_u.u6_addr16[i];
+	}
+	sum += (ip6->payload_len);
+	sum += bpf_htons(ip6->nexthdr);
+
+	/* Deal with rollover (twice, instead of looping) */
+	if(sum > 0xffff)
+		sum = (sum & 0xffff) + (sum >> 16);
+	if(sum > 0xffff)
+		sum = (sum & 0xffff) + (sum >> 16);
+	
+	return ~sum;
+}
+
+/* Function to add checksums */
+static inline u16 check_add(u16 a,u16 b)
+{
+	u32 sum = (u16)~a + (u16)~b;
+
+	/* Deal with rollover */
+	return ~((sum & 0xffff) + (sum >> 16));
+}
+
+
 
 /* Process packets in the 6->4 direction */
 static inline int tc_nat64(struct __sk_buff *skb)
@@ -96,6 +128,9 @@ static inline int tc_nat64(struct __sk_buff *skb)
 		}
 	}
 
+	/* At this point, store our checksum for modification later */
+	u16 ip6check = check_ip6(ip6);
+
 	int idx = 1;
 	struct in6_addr *prefix = bpf_map_lookup_elem(&addrs,&idx);
 	if(!prefix){
@@ -103,21 +138,27 @@ static inline int tc_nat64(struct __sk_buff *skb)
 		return TC_ACT_OK;
 	}
 
-	/* Check if the received source was the PLAT/NAT64, otherwise drop it */
+	/* Check if the received source was the PLAT/NAT64 */
+	if((ip6->saddr.in6_u.u6_addr32[0] != prefix->in6_u.u6_addr32[0]) ||
+		(ip6->saddr.in6_u.u6_addr32[1] != prefix->in6_u.u6_addr32[1]) ||
+		(ip6->saddr.in6_u.u6_addr32[2] != prefix->in6_u.u6_addr32[2]))
 	{
-		/* Compare 3 words to local clat */
-		if((ip6->saddr.in6_u.u6_addr32[0] != prefix->in6_u.u6_addr32[0]) ||
-		   (ip6->saddr.in6_u.u6_addr32[1] != prefix->in6_u.u6_addr32[1]) ||
-		   (ip6->saddr.in6_u.u6_addr32[2] != prefix->in6_u.u6_addr32[2]))
+		/* If the protocol is not ICMPv6, then drop it */
+		if(ip6->nexthdr != PROTO_ICMP6)
 		{
-			bpf_printk("Rogue packet tried to sneak by the clat from source %04x:%04x:%04x:%04x:%04x:%04x:%04x:%04x",
+			bpf_printk("Rogue packet tried to sneak by the clat from source %04x:%04x:%04x:%04x:%04x:%04x:%04x:%04x proto %d",
 				bpf_htons(ip6->saddr.in6_u.u6_addr16[0]),bpf_htons(ip6->saddr.in6_u.u6_addr16[1]),
 				bpf_htons(ip6->saddr.in6_u.u6_addr16[2]),bpf_htons(ip6->saddr.in6_u.u6_addr16[3]),
 				bpf_htons(ip6->saddr.in6_u.u6_addr16[4]),bpf_htons(ip6->saddr.in6_u.u6_addr16[5]),
-				bpf_htons(ip6->saddr.in6_u.u6_addr16[6]),bpf_htons(ip6->saddr.in6_u.u6_addr16[7]));
+				bpf_htons(ip6->saddr.in6_u.u6_addr16[6]),bpf_htons(ip6->saddr.in6_u.u6_addr16[7]),
+				ip6->nexthdr);
 			return TC_ACT_SHOT;
 		}
-	};
+		/* Here it's an ICMP packet, probably from a v6 router on the network
+		 * Treat the ICMP packet as if it was sent by us and translate appropriately
+		 */
+		ip6->saddr.in6_u.u6_addr32[3] = prefix->in6_u.u6_addr32[3];
+	}
 
 
 	/* Create a v4 header struct and copy over parameters */
@@ -125,7 +166,7 @@ static inline int tc_nat64(struct __sk_buff *skb)
 		.version = 4,
 		.ihl = sizeof(struct iphdr)/sizeof(__u32),
 		.tos = (ip6->priority << 4) + (ip6->flow_lbl[0] >> 4),
-		.tot_len = ip6->payload_len + 20,
+		.tot_len = bpf_htons(bpf_ntohs(ip6->payload_len) + 20),
 		.protocol = ((ip6->nexthdr == PROTO_ICMP6) ? PROTO_ICMP : ip6->nexthdr),
 		/* Per RFCs we should act as a router and decrement TTL
 		 * However, we are acting as a CLAT on the local system
@@ -165,6 +206,8 @@ static inline int tc_nat64(struct __sk_buff *skb)
 		/* Read old header */
 		struct icmphdr *icmp = (struct icmphdr *)(ip4 + 1);
 		if ((void *)(icmp + 1) > data_end) return TC_ACT_SHOT;
+		/* Store codes for later */
+		u16 codes = (icmp->code << 8) + icmp->type;
 		/* Map ICMPv4 Codes to ICMPv6 Types+Codes */
 		switch(icmp->type)
 		{
@@ -232,14 +275,26 @@ static inline int tc_nat64(struct __sk_buff *skb)
 				return TC_ACT_SHOT;
 				break;
 		}
+		u16 codes_new = (icmp->code << 8) + (icmp->type);
 		/* Recalc ICMPv4 checksum */
-		
+		icmp->checksum = check_add(icmp->checksum,~ip6check);
+		icmp->checksum = check_add(icmp->checksum,(codes - codes_new));
 	}
+	/* Calc IPv4 header checksum (IP4 header is 20 bytes) */
+	u32 csum = 0xffff;
+	u16 *ip4hdr = (u16 *)ip4;
+	csum += ip4hdr[0] + ip4hdr[1] + ip4hdr[2] + ip4hdr[3] + ip4hdr[4];
+	csum += ip4hdr[5] + ip4hdr[6] + ip4hdr[7] + ip4hdr[8] + ip4hdr[9];
 
-	/* Nothing else requires translation? */
+	/* Deal with rollover (twice, instead of looping) */
+	if(csum > 0xffff)
+		csum = (csum & 0xffff) + (csum >> 16);
+	if(csum > 0xffff)
+		csum = (csum & 0xffff) + (csum >> 16);
+	ip4->check = ~csum;
 
 	/* If execution gets here packet is fully translated, we should redirect it to loopback */
-	return bpf_redirect(1,BPF_F_INGRESS);
+	return bpf_redirect(3,BPF_F_INGRESS);
 	return TC_ACT_OK;
 }
 
@@ -274,7 +329,6 @@ static inline int tc_nat46(struct __sk_buff *skb)
 		return TC_ACT_OK;
 	}
 
-	bpf_printk("In the NAT46 Realm");
 	/* Create a v6 header struct and copy over parameters */
 	struct ipv6hdr ip6_temp = 
 	{
@@ -375,8 +429,9 @@ static inline int tc_nat46(struct __sk_buff *skb)
 	if(ip6->nexthdr == PROTO_ICMP6) {
 		/* Read old header */
 		struct icmphdr *icmp = (struct icmphdr *)(ip6 + 1);
-		struct icmp6hdr *icmp6 = (struct icmp6hdr *)icmp;
 		if ((void *)(icmp + 1) > data_end) return TC_ACT_SHOT;
+		/* Store first u16 for checksum recalc later */
+		u16 codes = (icmp->code << 8) + icmp->type;
 		/* Map ICMPv4 Codes to ICMPv6 Types+Codes */
 		switch(icmp->type)
 		{
@@ -464,9 +519,18 @@ static inline int tc_nat46(struct __sk_buff *skb)
 				return TC_ACT_SHOT;
 				break;
 		}
+		/* Fix ICMP checksum:
+		 * Add IPv6 psuedo-header
+		 * Difference in type/code
+		 */
+		u16 codes_new = (icmp->code << 8) + icmp->type;
+		u16 old = icmp->checksum;
+		u16 new6 = check_ip6(ip6);
+		icmp->checksum = check_add(old,check_add(new6,~(codes_new - codes)));
 	}
-
-	/* Nothing else requires translation? */
+	/* We assume the higher layer software has chosen our addresses such that
+	 * they are checksum-neutral and we can ignore UDP and TCP translations
+	 */
 
 	/* If execution gets here packet is fully translated, we should redirect it */
 	return bpf_redirect(fib_params.ifindex,0);
