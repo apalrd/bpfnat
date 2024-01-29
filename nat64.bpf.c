@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause)
-/* Copyright (c) 2022 Hengqi Chen */
+/* Copyright (c) 2024 Andrew Palardy */
 #include <vmlinux.h>
 #include <bpf/bpf_endian.h>
 #include <bpf/bpf_helpers.h>
@@ -28,7 +28,14 @@ enum ICMP_TYPES {
 	ICMP_TYPE_PARAM_PROBLEM = 12
 };
 
-/* ICMPv6 Codes */
+/* ICMP unreachable error codes */
+enum ICMP_CODES {
+	ICMP_CODE_NET_UNREACH = 0,
+	ICMP_CODE_HOST_UNREACH,
+	ICMP_CODE_TOO_BIG = 4,
+};
+
+/* ICMPv6 Types */
 enum ICMP6_TYPES {
 	ICMP6_TYPE_DEST_UNREACH = 1,
 	ICMP6_TYPE_TOO_BIG = 2,
@@ -103,6 +110,8 @@ static inline int tc_nat64(struct __sk_buff *skb)
 
 	/* Header must be IPv6 */
 	if(ip6->version != 6) return TC_ACT_OK;
+
+	bpf_printk("In NAT64");
 
 	/* Get the first map (local clat address) */
 	{
@@ -184,8 +193,6 @@ static inline int tc_nat64(struct __sk_buff *skb)
 		/* Oops, well this packet got lost */
 		return TC_ACT_SHOT;
 	}
-
-	bpf_printk("In the NAT64 Realm");
 	
 	/* At this point we need to re-validate all pointers and need to fill in everything again */
 	data_end = (void *)(__u64)skb->data_end;
@@ -271,7 +278,6 @@ static inline int tc_nat64(struct __sk_buff *skb)
 				}
 			default:
 				/* We are supposed to silently drop all other codes or unknown types */
-				bpf_printk("ICMPv6 Unknown Type %d Code %d (dropping)",icmp->type,icmp->code);
 				return TC_ACT_SHOT;
 				break;
 		}
@@ -293,11 +299,123 @@ static inline int tc_nat64(struct __sk_buff *skb)
 		csum = (csum & 0xffff) + (csum >> 16);
 	ip4->check = ~csum;
 
-	/* If execution gets here packet is fully translated, we should redirect it to loopback */
-	return bpf_redirect(3,BPF_F_INGRESS);
+
+	/* If execution gets here packet is fully translated, we should redirect it to our own ingress
+	 * The kernel will take care of it then
+	 */
+	return bpf_redirect(skb->ifindex,BPF_F_INGRESS);
 	return TC_ACT_OK;
 }
 
+static inline int tc_nat46_icmp_unreach(struct __sk_buff *skb,enum ICMP_CODES code,u16 mtu)
+{
+	/* So our packet is unreachable for some reason
+	 * We need to use that packet space to construct an ICMPv4 return
+	 * We need an 8 byte ICMP header + the orig IP header (20) + orig 8 byte of payload
+	 * So the gameplan is:
+	 * Copy the 28 bytes from the end (so we don't overwrite in place)
+	 * Construct new 8 byte header
+	 * Construct new IP header
+	 * Fix all the checksums we've messed up so far (aka recalc them)
+	 */
+	/* Ensure that we have at least the packet we need (eth + ipv4 + 8 bytes) */
+	void *data_end = (void *)(__u64)skb->data_end;
+	void *data = (void *)(__u64)skb->data;
+	if((data_end - data) < (sizeof(struct ethhdr) + sizeof(struct iphdr) + 8)) return TC_ACT_SHOT;
+
+	/* Store the first 8 bytes of the L4 packet since it will get lost on resize */
+	u32 *l4 = (data + sizeof(struct ethhdr) + sizeof(struct iphdr));
+	if((void *)(&l4[1]+1) > data_end) return TC_ACT_SHOT;
+	u32 l4_temp[2] = {l4[0],l4[1]};
+	bpf_printk("Saved L4 bytes from destruction");
+
+	/* Shrink the packet down to the length we need  */
+	#define NEW_SIZE (sizeof(struct ethhdr) + 2*sizeof(struct iphdr) + sizeof(struct icmphdr) + 8)
+	int resize = NEW_SIZE - skb->len;
+	if(bpf_skb_adjust_room(skb,resize,BPF_ADJ_ROOM_NET,0)) return TC_ACT_SHOT;
+
+	/* Now ask for visibility into the whole damn thing */
+	if(bpf_skb_pull_data(skb,NEW_SIZE)) return TC_ACT_SHOT;
+
+	/* Re-validate pointers again */
+	data_end = (void *)(__u64)skb->data_end;
+	data = (void *)(__u64)skb->data;
+	bpf_printk("Re-validating headers");
+	if((data_end - data) < NEW_SIZE) return TC_ACT_SHOT;
+
+	/* Now we need to kick the existing l3 headers down by 28 bytes
+	 * and add in our 8 bytes of packet that we lost
+	 */
+	u32 *l3 = (data + sizeof(struct ethhdr));
+	if((void *)(&l3[13]+1) > data_end) return TC_ACT_SHOT;
+
+	/* Brute-force memcpy of these bytes */
+	l3[13] = l4_temp[1];
+	l3[12] = l4_temp[0];
+	for(int i = 0; i < 5; i++)
+	{
+		l3[7+i] = l3[i];
+	}
+
+	/* Setup our new headers */
+	struct iphdr *ip4 = (struct iphdr *)l3;
+	struct icmphdr *icmp = (struct icmphdr *)&l3[5];
+
+	/* At this point the IP header is what it was before, so we only 
+	 * need to modify fields that changed
+	 */
+	bpf_printk("Time to build our new ICMP header and IP header");
+	/* Back to sender */
+	ip4->daddr = ip4->saddr;
+	ip4->saddr = bpf_htonl(0xC0000004); //TODO fix this so it comes from the map
+	ip4->protocol = PROTO_ICMP;
+	ip4->ttl = 2; //Only going to the local system
+	ip4->tot_len = bpf_htons(2*sizeof(struct iphdr)+sizeof(struct icmphdr)+8);
+
+	/* ICMP header */
+	icmp->type = 3;
+	icmp->code = code;
+	icmp->un.frag.__unused = 0;
+	icmp->un.frag.mtu = (code == ICMP_CODE_TOO_BIG) ? bpf_htons(mtu) : 0;
+
+	/* Data is now in place */
+	bpf_printk("Data is now in place");
+
+	/* Calculate ICMP checksum across 36 bytes */
+	u32 csum = 0xffff;
+	u16 *icmphdr = (u16 *)icmp;
+	icmp->checksum = 0;
+	if((void *)(&icmphdr[17]+1) > data_end) return TC_ACT_SHOT;
+	csum += icmphdr[0] + icmphdr[1] + icmphdr[2] + icmphdr[3] + icmphdr[4];
+	csum += icmphdr[5] + icmphdr[6] + icmphdr[7] + icmphdr[8] + icmphdr[9];
+	csum += icmphdr[10] + icmphdr[11] + icmphdr[12] + icmphdr[13] + icmphdr[14];
+	csum += icmphdr[15] + icmphdr[16] + icmphdr[17];
+
+	/* Deal with rollover (twice, instead of looping) */
+	if(csum > 0xffff)
+		csum = (csum & 0xffff) + (csum >> 16);
+	if(csum > 0xffff)
+		csum = (csum & 0xffff) + (csum >> 16);
+	icmp->checksum = ~csum;
+
+	/* Calc new IPv4 header checksum (IP4 header is 20 bytes) */
+	csum = 0xffff;
+	u16 *ip4hdr = (u16 *)ip4;
+	ip4->check = 0;
+	csum += ip4hdr[0] + ip4hdr[1] + ip4hdr[2] + ip4hdr[3] + ip4hdr[4];
+	csum += ip4hdr[5] + ip4hdr[6] + ip4hdr[7] + ip4hdr[8] + ip4hdr[9];
+
+	/* Deal with rollover (twice, instead of looping) */
+	if(csum > 0xffff)
+		csum = (csum & 0xffff) + (csum >> 16);
+	if(csum > 0xffff)
+		csum = (csum & 0xffff) + (csum >> 16);
+	ip4->check = ~csum;
+
+	bpf_printk("Yeeting the ICMP error back where it came from");
+	/* Yeet the packet back where it came from */
+	return bpf_redirect(skb->ifindex,BPF_F_INGRESS);
+}
 
 
 /* Process packets in the 4->6 direction */
@@ -345,11 +463,31 @@ static inline int tc_nat46(struct __sk_buff *skb)
 		.hop_limit = ip4->ttl,
 	};
 
-	/* Translate addresses */
-	ip6_temp.saddr.in6_u.u6_addr32[0] = bpf_htonl(0x2601040e);
-	ip6_temp.saddr.in6_u.u6_addr32[1] = bpf_htonl(0x8102ccc0);
-	ip6_temp.saddr.in6_u.u6_addr32[3] = bpf_htonl(0x00006464);
-	ip6_temp.daddr.in6_u.u6_addr32[0] = bpf_htonl(0x0064ff9b);
+	int idx = 0;
+	struct in6_addr *local = bpf_map_lookup_elem(&addrs,&idx);
+	if(!local){
+		bpf_printk("Unable to read local addr");
+		return TC_ACT_OK;
+	}
+	idx = 1;
+	struct in6_addr *prefix = bpf_map_lookup_elem(&addrs,&idx);
+	if(!prefix){
+		bpf_printk("Unable to read prefix addr");
+		return TC_ACT_OK;
+	}
+
+	bpf_printk("In NAT46");
+
+	/* Source Addr is our local */
+	ip6_temp.saddr.in6_u.u6_addr32[0] = local->in6_u.u6_addr32[0];
+	ip6_temp.saddr.in6_u.u6_addr32[1] = local->in6_u.u6_addr32[1];
+	ip6_temp.saddr.in6_u.u6_addr32[2] = local->in6_u.u6_addr32[2];
+	ip6_temp.saddr.in6_u.u6_addr32[3] = local->in6_u.u6_addr32[3];
+
+	/* Dest Addr is prefix + actual v4 destination */
+	ip6_temp.daddr.in6_u.u6_addr32[0] = prefix->in6_u.u6_addr32[0];
+	ip6_temp.daddr.in6_u.u6_addr32[1] = prefix->in6_u.u6_addr32[1];
+	ip6_temp.daddr.in6_u.u6_addr32[2] = prefix->in6_u.u6_addr32[2];
 	ip6_temp.daddr.in6_u.u6_addr32[3] = ip4->daddr;
 	
 	/* Do Early FIB lookup to determine if we must send ICMP rejection back up */
@@ -384,10 +522,15 @@ static inline int tc_nat46(struct __sk_buff *skb)
 		 * so we can transform the current packet into an ICMP and 
 		 * hairpin it back to the source before we do 4->6 translate
 		 */
+			case BPF_FIB_LKUP_RET_FRAG_NEEDED:		
 			case BPF_FIB_LKUP_RET_UNREACHABLE:
 			case BPF_FIB_LKUP_RET_PROHIBIT:
 			case BPF_FIB_LKUP_RET_NO_NEIGH:
-			case BPF_FIB_LKUP_RET_FRAG_NEEDED:
+				bpf_printk("Got FIB Lookup Failure %d (ifid %d), v4 size %d v6 size %d",rc,fib_params.ifindex,bpf_ntohs(ip4->tot_len),bpf_ntohs(ip6_temp.payload_len));
+				bpf_printk("GSO data: wire_len %d gso_segs %d gso_size %d",skb->wire_len,skb->gso_segs,skb->gso_size);
+				/* Irrespective of the DF bit, we are going to reply with ICMPv4 Dest Unreach + Frag Required */
+				return tc_nat46_icmp_unreach(skb,ICMP_CODE_TOO_BIG,fib_params.mtu_result-20);
+				break;
 			/* The remainder can get dropped */
 			case BPF_FIB_LKUP_RET_BLACKHOLE:
 			default:
